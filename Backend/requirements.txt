@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+xarray
+netCDF4
+numpy
+pandas
+faiss-cpu
+openai
+pydantic
