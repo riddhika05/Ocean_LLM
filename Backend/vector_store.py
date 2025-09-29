@@ -2,7 +2,17 @@ import faiss
 import numpy as np
 from openai import OpenAI
 
-client = OpenAI(api_key="YOUR_OPENAI_KEY")
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
+
+# Get the OpenAI API key
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+# Initialize OpenAI client
+client = OpenAI(api_key=openai_api_key)
 
 class VectorStore:
     def __init__(self, dimension):
