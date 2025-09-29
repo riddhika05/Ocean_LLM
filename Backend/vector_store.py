@@ -1,36 +1,45 @@
 import faiss
 import numpy as np
-from openai import OpenAI
-
 import os
 from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
 
 # Load environment variables from .env
 load_dotenv()
 
-# Get the OpenAI API key
-openai_api_key = os.getenv("OPENAI_API_KEY")
+# --- Initialize Hugging Face Embedding Model ---
+# Using a highly-rated, fast embedding model as an example.
+# This model will be downloaded the first time it's run.
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
-# Initialize OpenAI client
-client = OpenAI(api_key=openai_api_key)
 
 class VectorStore:
     def __init__(self, dimension):
+        # The dimension must match the output size of the chosen embedding model
         self.index = faiss.IndexFlatL2(dimension)  # FAISS index (L2 distance)
         self.texts = []  # Keep original texts for retrieval
 
     def add(self, text, embedding):
-        self.index.add(np.array([embedding], dtype='float32'))  # Store vector
+        # Ensure embedding is a numpy array
+        if not isinstance(embedding, np.ndarray):
+            embedding = np.array(embedding, dtype='float32')
+        self.index.add(embedding.reshape(1, -1).astype('float32'))  # Store vector
         self.texts.append(text)  # Save original text
 
     def query(self, embedding, top_k=1):
-        D, I = self.index.search(np.array([embedding], dtype='float32'), top_k)
+        # Ensure embedding is a numpy array
+        if not isinstance(embedding, np.ndarray):
+            embedding = np.array(embedding, dtype='float32')
+        D, I = self.index.search(embedding.reshape(1, -1).astype('float32'), top_k)
         return [self.texts[i] for i in I[0]]  # Return closest text(s)
 
-def embed_text(text):
-    response = client.embeddings.create(
-        model="text-embedding-3-small",  # Low-cost embedding model
-        input=text
-    )
-    return response['data'][0]['embedding']
 
+# --- Embedding Function using Hugging Face Model ---
+def embed_text(text):
+    # The SentenceTransformer model returns a numpy array
+    embedding = embedding_model.encode(text)
+    return embedding  # Return as numpy array for consistency
+
+# Note: The 'all-MiniLM-L6-v2' model produces a 384-dimensional vector.
+# You MUST update the vector_dim in main.py to 384.

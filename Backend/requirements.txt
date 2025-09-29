@@ -5,6 +5,10 @@ netCDF4
 numpy
 pandas
 faiss-cpu
-openai
 pydantic
 python-dotenv
+transformers
+torch
+huggingface-hub
+sentence-transformers
+sentencepiece
