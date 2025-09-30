@@ -1,3 +1,7 @@
+
+
+
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,19 +12,10 @@ import os
 from dotenv import load_dotenv
 import re
 
-# --- Hugging Face Imports ---
-# Using AutoModelForSeq2SeqLM for Flan-T5 (Encoder-Decoder) architecture
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
-import torch
-# ----------------------------
-
-# Assuming VectorStore and embed_text are available from vector_store
-from vector_store import VectorStore, embed_text
-
 # Load environment variables from .env
 load_dotenv()
 
-# Initialize FastAPI
+# --- Initialize FastAPI FIRST (before anything that might crash) ---
 app = FastAPI()
 
 # Enable CORS for local development and simple web clients
@@ -32,11 +27,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- NOW Import heavy dependencies ---
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+import torch
+
+# Assuming VectorStore and embed_text are available from vector_store
+from vector_store import VectorStore, embed_text
+
 # --- Initialize Hugging Face LLM for Generation ---
 generator = None
 tokenizer = None
 
-# Using Flan-T5 Base (approx. 250M parameters) - the best balance of performance and size for RAG
+# Using Flan-T5 Base (approx. 250M parameters)
 LLM_MODEL_NAME = "google/flan-t5-base"
 print(f"Loading model: {LLM_MODEL_NAME}...")
 
@@ -51,13 +53,14 @@ try:
     )
     print("✓ Model weights loaded")
 
-    # Use CPU (-1) since the model is small and this is safer for general environments
+    # Use CPU
     device = -1
     model = model.to("cpu")
     model.eval()
     print("✓ Model moved to CPU")
+    print(f"Device set to use cpu")
 
-    # Use the text2text-generation pipeline for sequence-to-sequence models
+    # Use the text2text-generation pipeline
     generator = pipeline(
         "text2text-generation",
         model=model,
@@ -68,7 +71,6 @@ try:
 
 except Exception as e:
     import traceback
-
     print(f"✗ Failed to load model: {e}")
     print(traceback.format_exc())
 
@@ -79,20 +81,19 @@ except Exception as e:
                 "generated_text": "Error: Model loading failed. Cannot generate response. Please check logs."
             }
         ]
-
     generator = _fallback_generator
 
 # ----- Read NetCDF & flatten to text -----
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, "data", "india_ocean_data.nc")
+DATA_PATH = os.path.join(BASE_DIR, "data", "bay_of_bengal_data.nc")
 
 # Try multiple possible paths
 possible_paths = [
     DATA_PATH,
-    os.path.join(BASE_DIR, "india_ocean_data.nc"),
-    os.path.join(os.path.dirname(BASE_DIR), "data", "india_ocean_data.nc"),
-    os.path.join(os.getcwd(), "data", "indian_ocean_data.nc"),
-    os.path.join(os.getcwd(), "india_ocean_data.nc"),
+    os.path.join(BASE_DIR, "bay_of_bengal_data.nc"),
+    os.path.join(os.path.dirname(BASE_DIR), "data", "bay_of_bengal_data.nc"),
+    os.path.join(os.getcwd(), "data", "bay_of_bengal_data.nc"),
+    os.path.join(os.getcwd(), "bay_of_bengal_data.nc"),
 ]
 
 print(f"Searching for ocean data in possible locations...")
@@ -115,14 +116,14 @@ if ds is None:
     print("\n" + "="*60)
     print("✗ DATASET NOT FOUND!")
     print("="*60)
-    print("Please ensure 'india_ocean_data.nc' is in one of these locations:")
+    print("Please ensure 'bay_of_bengal_data.nc' is in one of these locations:")
     for path in possible_paths:
         print(f"  - {path}")
     print("\nYou can generate it using the Python script provided earlier.")
     print("="*60 + "\n")
 
 # ----- Create vector store with enhanced data chunks -----
-vector_dim = 384  # for 'all-MiniLM-L6-v2' (the typical embedding model)
+vector_dim = 384  # for 'all-MiniLM-L6-v2'
 store = VectorStore(dimension=vector_dim)
 texts = []
 
@@ -134,13 +135,13 @@ if ds is not None:
     lat_sample = ds.lat.values[::10]
     lon_sample = ds.lon.values[::10]
     
-    # Sample times: monthly (every 30 days)
-    time_sample = ds.time.values[::30]
+    # Sample times: all time steps (monthly already)
+    time_sample = ds.time.values
     
     chunk_count = 0
     for lat in lat_sample[:10]:  # Limit to 10 lat points
         for lon in lon_sample[:10]:  # Limit to 10 lon points
-            for time in time_sample[:12]:  # 12 months
+            for time in time_sample:  # All 12 months
                 try:
                     # Extract data at this point
                     point = ds.sel(lat=lat, lon=lon, time=time, method='nearest')
@@ -151,33 +152,15 @@ if ds is not None:
                         f"Date: {pd.Timestamp(time).strftime('%Y-%m-%d')}. "
                     )
                     
-                    # Add surface data
-                    if 'sea_surface_temperature' in ds:
-                        sst = float(point['sea_surface_temperature'].values)
-                        text += f"Sea surface temperature: {sst:.2f}°C. "
-                    
+                    # Add temperature
                     if 'temperature' in ds:
-                        surf_temp = float(point['temperature'].sel(depth=0, method='nearest').values)
-                        text += f"Surface temperature: {surf_temp:.2f}°C. "
-                        
-                        # Add temperature at depth
-                        if 100 in ds.depth.values or len(ds.depth) > 3:
-                            deep_temp = float(point['temperature'].sel(depth=100, method='nearest').values)
-                            text += f"Temperature at 100m depth: {deep_temp:.2f}°C. "
+                        temp = float(point['temperature'].values)
+                        text += f"Sea surface temperature: {temp:.2f}°C. "
                     
+                    # Add salinity
                     if 'salinity' in ds:
-                        surf_sal = float(point['salinity'].sel(depth=0, method='nearest').values)
-                        text += f"Surface salinity: {surf_sal:.2f} PSU. "
-                    
-                    if 'chlorophyll' in ds:
-                        chl = float(point['chlorophyll'].values)
-                        text += f"Chlorophyll-a: {chl:.3f} mg/m³. "
-                    
-                    if 'u_current' in ds and 'v_current' in ds:
-                        u = float(point['u_current'].sel(depth=0, method='nearest').values)
-                        v = float(point['v_current'].sel(depth=0, method='nearest').values)
-                        speed = np.sqrt(u**2 + v**2)
-                        text += f"Surface current speed: {speed:.2f} m/s. "
+                        sal = float(point['salinity'].values)
+                        text += f"Surface salinity: {sal:.2f} PSU. "
                     
                     texts.append(text)
                     chunk_count += 1
@@ -211,24 +194,30 @@ def extract_query_params(question: str):
     params = {}
     
     # Extract latitude
-    lat_match = re.search(r'lat(?:itude)?[=\s]+(-?\d+\.?\d*)', question, re.IGNORECASE)
+    lat_match = re.search(r'lat(?:itude)?[=\s:]+(-?\d+\.?\d*)', question, re.IGNORECASE)
     if lat_match:
         params['lat'] = float(lat_match.group(1))
     
     # Extract longitude
-    lon_match = re.search(r'lon(?:gitude)?[=\s]+(-?\d+\.?\d*)', question, re.IGNORECASE)
+    lon_match = re.search(r'lon(?:gitude)?[=\s:]+(-?\d+\.?\d*)', question, re.IGNORECASE)
     if lon_match:
         params['lon'] = float(lon_match.group(1))
     
     # Extract depth
-    depth_match = re.search(r'depth[=\s]+(-?\d+\.?\d*)', question, re.IGNORECASE)
+    depth_match = re.search(r'depth[=\s:]+(-?\d+\.?\d*)', question, re.IGNORECASE)
     if depth_match:
         params['depth'] = float(depth_match.group(1))
     
-    # Extract date
+    # Extract date (various formats)
     date_match = re.search(r'(\d{4}-\d{2}-\d{2})', question)
     if date_match:
         params['time'] = date_match.group(1)
+    
+    # Extract month names
+    month_match = re.search(r'(january|february|march|april|may|june|july|august|september|october|november|december)', question, re.IGNORECASE)
+    if month_match:
+        month_name = month_match.group(1).capitalize()
+        params['month'] = month_name
     
     return params
 
@@ -249,76 +238,75 @@ def query_dataset_directly(question: str, params: dict):
             # Add time if specified
             if 'time' in params:
                 point = point.sel(time=params['time'], method='nearest')
-            
-            # Add depth if specified
-            if 'depth' in params and 'temperature' in ds:
-                depth = params['depth']
-                point = point.sel(depth=depth, method='nearest')
+            elif 'month' in params:
+                # Convert month name to time
+                month_map = {
+                    'January': '2024-01', 'February': '2024-02', 'March': '2024-03',
+                    'April': '2024-04', 'May': '2024-05', 'June': '2024-06',
+                    'July': '2024-07', 'August': '2024-08', 'September': '2024-09',
+                    'October': '2024-10', 'November': '2024-11', 'December': '2024-12'
+                }
+                month_time = month_map.get(params['month'])
+                if month_time:
+                    point = point.sel(time=month_time, method='nearest')
             
             # Build response based on what's being asked
-            response = f"At location (lat={lat}, lon={lon}"
-            if 'depth' in params:
-                response += f", depth={params['depth']}m"
+            response = f"At location (lat={lat}°N, lon={lon}°E"
             if 'time' in params:
                 response += f", date={params['time']}"
+            elif 'month' in params:
+                response += f", month={params['month']}"
             response += "):\n"
             
             # Check what variable is being asked about
             if 'temperature' in question.lower() and 'temperature' in point:
-                temp = float(point['temperature'].values) if 'depth' in params else float(point['temperature'].sel(depth=0).values)
+                temp = float(point['temperature'].values)
                 response += f"Temperature: {temp:.2f}°C"
                 return response
             
             elif 'salinity' in question.lower() and 'salinity' in point:
-                sal = float(point['salinity'].values) if 'depth' in params else float(point['salinity'].sel(depth=0).values)
+                sal = float(point['salinity'].values)
                 response += f"Salinity: {sal:.2f} PSU"
                 return response
             
-            elif 'chlorophyll' in question.lower() and 'chlorophyll' in point:
-                chl = float(point['chlorophyll'].values)
-                response += f"Chlorophyll-a: {chl:.3f} mg/m³"
-                return response
-            
-            elif 'current' in question.lower():
-                if 'u_current' in point and 'v_current' in point:
-                    u = float(point['u_current'].sel(depth=0).values)
-                    v = float(point['v_current'].sel(depth=0).values)
-                    speed = np.sqrt(u**2 + v**2)
-                    direction = np.degrees(np.arctan2(v, u))
-                    response += f"Current speed: {speed:.2f} m/s, Direction: {direction:.1f}°"
-                    return response
-            
             # If no specific variable, give overview
-            response += "\n"
             if 'temperature' in point:
-                temp = float(point['temperature'].sel(depth=0).values)
+                temp = float(point['temperature'].values)
                 response += f"- Temperature: {temp:.2f}°C\n"
             if 'salinity' in point:
-                sal = float(point['salinity'].sel(depth=0).values)
+                sal = float(point['salinity'].values)
                 response += f"- Salinity: {sal:.2f} PSU\n"
-            if 'chlorophyll' in point:
-                chl = float(point['chlorophyll'].values)
-                response += f"- Chlorophyll: {chl:.3f} mg/m³\n"
             
             return response.strip()
         
         # Handle aggregate queries
         if 'average' in question.lower() or 'mean' in question.lower():
             if 'temperature' in question.lower():
-                avg_temp = float(ds['sea_surface_temperature'].mean().values)
+                avg_temp = float(ds['temperature'].mean().values)
                 return f"The average sea surface temperature across all data is {avg_temp:.2f}°C"
             elif 'salinity' in question.lower():
-                avg_sal = float(ds['salinity'].sel(depth=0).mean().values)
+                avg_sal = float(ds['salinity'].mean().values)
                 return f"The average surface salinity across all data is {avg_sal:.2f} PSU"
         
         if 'maximum' in question.lower() or 'max' in question.lower() or 'highest' in question.lower():
             if 'temperature' in question.lower():
-                max_temp = float(ds['sea_surface_temperature'].max().values)
-                max_loc = ds['sea_surface_temperature'].where(
-                    ds['sea_surface_temperature'] == ds['sea_surface_temperature'].max(), drop=True
+                max_temp = float(ds['temperature'].max().values)
+                max_loc = ds['temperature'].where(
+                    ds['temperature'] == ds['temperature'].max(), drop=True
                 )
                 max_time = pd.Timestamp(max_loc.time.values[0]).strftime('%Y-%m-%d')
                 return f"The maximum sea surface temperature is {max_temp:.2f}°C, occurring on {max_time}"
+            elif 'salinity' in question.lower():
+                max_sal = float(ds['salinity'].max().values)
+                return f"The maximum surface salinity is {max_sal:.2f} PSU"
+        
+        if 'minimum' in question.lower() or 'min' in question.lower() or 'lowest' in question.lower():
+            if 'temperature' in question.lower():
+                min_temp = float(ds['temperature'].min().values)
+                return f"The minimum sea surface temperature is {min_temp:.2f}°C"
+            elif 'salinity' in question.lower():
+                min_sal = float(ds['salinity'].min().values)
+                return f"The minimum surface salinity is {min_sal:.2f} PSU"
         
     except Exception as e:
         print(f"Error in direct query: {e}")
@@ -335,12 +323,7 @@ class QueryRequest(BaseModel):
 def ask_llm(context: str, question: str) -> str:
     """
     Generate answer using the Flan-T5 model based on retrieved context.
-
-    Improved, directive prompt structure for better RAG performance.
     """
-    # ----------------------------------------------------------------------
-    # PROMPT for Seq2Seq LM (Flan-T5): Designed to constrain output
-    # ----------------------------------------------------------------------
     prompt = (
 f"""Based ONLY on the following ocean data points, answer the user's question concisely and factually. 
 If the information is not present in the data, state that you cannot answer based on the context.
@@ -353,7 +336,6 @@ QUESTION:
 
 ANSWER:"""
     )
-    # ----------------------------------------------------------------------
 
     try:
         # Check if the generator is the fallback function
@@ -363,18 +345,13 @@ ANSWER:"""
         # Flan-T5 (Seq2Seq) generation parameters
         result = generator(
             prompt,
-            max_new_tokens=100,
+            max_new_tokens=150,
             num_return_sequences=1,
-            # return_full_text is ignored for Seq2Seq pipelines, 
-            # as they only return the generated answer sequence.
             truncation=True,
         )
 
         if result and len(result) > 0 and "generated_text" in result[0]:
-            # The result should be the direct answer
             answer = result[0]["generated_text"].strip()
-            
-            # Since Flan-T5 is much better at constraint, we don't need complex cleaning
             return answer if answer else "No answer could be generated by the model."
 
         return "Could not generate an answer based on the provided data."
@@ -401,7 +378,7 @@ def query(request: QueryRequest):
         
         # Step 2: Fall back to RAG pipeline
         query_emb = embed_text(request.question)
-        contexts = store.query(query_emb, top_k=3)
+        contexts = store.query(query_emb, top_k=5)
         combined_context = "\n".join(contexts)
 
         if not combined_context:
@@ -409,14 +386,29 @@ def query(request: QueryRequest):
         else:
             answer = ask_llm(combined_context, request.question)
 
-        return {"answer": answer, "context_used": contexts}
+        return {
+            "answer": answer,
+            "method": "rag_pipeline",
+            "context_used": contexts
+        }
     except Exception as e:
-        return {"answer": f"Error processing query: {str(e)}", "context_used": []}
+        return {
+            "answer": f"Error processing query: {str(e)}",
+            "context_used": []
+        }
 
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Ocean RAG API is running"}
+    return {
+        "status": "ok",
+        "message": "Bay of Bengal Ocean RAG API is running",
+        "endpoints": {
+            "POST /query": "Submit a question about ocean data",
+            "GET /health": "Check API health",
+            "GET /dataset/info": "Get dataset information"
+        }
+    }
 
 
 @app.get("/health")
