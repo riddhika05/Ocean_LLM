@@ -1,1 +1,2 @@
 Backend/data/india_ocean_data.nc filter=lfs diff=lfs merge=lfs -text
+*.nc filter=lfs diff=lfs merge=lfs -text
