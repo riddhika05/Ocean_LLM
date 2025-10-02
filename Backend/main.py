@@ -1,7 +1,3 @@
-
-
-
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -139,9 +135,9 @@ if ds is not None:
     time_sample = ds.time.values
     
     chunk_count = 0
-    for lat in lat_sample[:10]:  # Limit to 10 lat points
-        for lon in lon_sample[:10]:  # Limit to 10 lon points
-            for time in time_sample:  # All 12 months
+    for lat in lat_sample[:1]:  # Limit to 10 lat points
+        for lon in lon_sample[:1]:  # Limit to 10 lon points
+            for time in time_sample[:1]:  # All 12 months
                 try:
                     # Extract data at this point
                     point = ds.sel(lat=lat, lon=lon, time=time, method='nearest')
