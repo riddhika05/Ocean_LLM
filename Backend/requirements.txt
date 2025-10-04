@@ -7,8 +7,5 @@ pandas
 faiss-cpu
 pydantic
 python-dotenv
-transformers
-torch
-huggingface-hub
 sentence-transformers
-sentencepiece
+google-genai
