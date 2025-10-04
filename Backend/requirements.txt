@@ -7,5 +7,4 @@ pandas
 faiss-cpu
 pydantic
 python-dotenv
-sentence-transformers
 google-genai

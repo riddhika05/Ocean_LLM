@@ -8,6 +8,10 @@ import os
 from dotenv import load_dotenv
 import re
 
+# Import for Gemini API
+from google import genai
+from google.genai import types
+
 # Load environment variables from .env
 load_dotenv()
 
@@ -23,61 +27,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- NOW Import heavy dependencies ---
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
-import torch
-
+# --- NOW Import heavy dependencies and Google GenAI SDK ---
 # Assuming VectorStore and embed_text are available from vector_store
 from vector_store import VectorStore, embed_text
 
-# --- Initialize Hugging Face LLM for Generation ---
-generator = None
-tokenizer = None
-
-# Using Flan-T5 Base (approx. 250M parameters)
-LLM_MODEL_NAME = "google/flan-t5-base"
-print(f"Loading model: {LLM_MODEL_NAME}...")
-
+# --- Initialize Gemini Client for Generation ---
+print("Initializing Gemini Client...")
+# Use the API Key from the environment variable 'GEMINI_API_KEY'
 try:
-    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
-    print("✓ Tokenizer loaded")
-
-    # Use AutoModelForSeq2SeqLM for Flan-T5
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        LLM_MODEL_NAME,
-        torch_dtype=torch.float32,
-    )
-    print("✓ Model weights loaded")
-
-    # Use CPU
-    device = -1
-    model = model.to("cpu")
-    model.eval()
-    print("✓ Model moved to CPU")
-    print(f"Device set to use cpu")
-
-    # Use the text2text-generation pipeline
-    generator = pipeline(
-        "text2text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        device=device,
-    )
-    print(f"✓ Pipeline created - Model {LLM_MODEL_NAME} loaded successfully!")
+    client = genai.Client()
+    LLM_MODEL_NAME = "gemini-2.0-flash-exp"
+    print(f"✓ Gemini Client initialized successfully with model: {LLM_MODEL_NAME}!")
 
 except Exception as e:
     import traceback
-    print(f"✗ Failed to load model: {e}")
+    print(f"✗ Failed to initialize Gemini Client: {e}")
     print(traceback.format_exc())
+    client = None
+    LLM_MODEL_NAME = "none (failed)"
 
-    # Fallback minimal generator
-    def _fallback_generator(prompt, **kwargs):
-        return [
-            {
-                "generated_text": "Error: Model loading failed. Cannot generate response. Please check logs."
-            }
-        ]
-    generator = _fallback_generator
 
 # ----- Read NetCDF & flatten to text -----
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -118,8 +86,20 @@ if ds is None:
     print("\nYou can generate it using the Python script provided earlier.")
     print("="*60 + "\n")
 
+# Store dataset bounds for validation
+DATASET_BOUNDS = None
+if ds is not None:
+    DATASET_BOUNDS = {
+        'lat_min': float(ds.lat.min()),
+        'lat_max': float(ds.lat.max()),
+        'lon_min': float(ds.lon.min()),
+        'lon_max': float(ds.lon.max())
+    }
+    print(f"Dataset bounds: Lat [{DATASET_BOUNDS['lat_min']}, {DATASET_BOUNDS['lat_max']}], "
+          f"Lon [{DATASET_BOUNDS['lon_min']}, {DATASET_BOUNDS['lon_max']}]")
+
 # ----- Create vector store with enhanced data chunks -----
-vector_dim = 384  # for 'all-MiniLM-L6-v2'
+vector_dim = 768  # for Gemini 'text-embedding-004'
 store = VectorStore(dimension=vector_dim)
 texts = []
 
@@ -127,31 +107,32 @@ if ds is not None:
     print("Preparing enhanced ocean data chunks for indexing...")
     
     # Sample spatial points and create descriptive summaries
-    # Sample every 10th lat/lon point to reduce data size
-    lat_sample = ds.lat.values[::10]
-    lon_sample = ds.lon.values[::10]
+    # Sample every 5th lat/lon point for better coverage
+    lat_sample = ds.lat.values[::5]
+    lon_sample = ds.lon.values[::5]
     
     # Sample times: all time steps (monthly already)
     time_sample = ds.time.values
     
     chunk_count = 0
-    for lat in lat_sample[:1]:  # Limit to 10 lat points
-        for lon in lon_sample[:1]:  # Limit to 10 lon points
-            for time in time_sample[:1]:  # All 12 months
+    # Index more data points (5 lat × 5 lon × 12 months = 300 points)
+    for lat in lat_sample[:5]:  # Use 5 lat points
+        for lon in lon_sample[:5]:  # Use 5 lon points
+            for time in time_sample[:12]:  # All 12 months
                 try:
                     # Extract data at this point
                     point = ds.sel(lat=lat, lon=lon, time=time, method='nearest')
                     
-                    # Create descriptive text chunk
+                    # Create descriptive text chunk (NO special characters)
                     text = (
-                        f"Location: Latitude {float(lat):.2f}°N, Longitude {float(lon):.2f}°E. "
+                        f"Location: Latitude {float(lat):.2f} degrees North, Longitude {float(lon):.2f} degrees East. "
                         f"Date: {pd.Timestamp(time).strftime('%Y-%m-%d')}. "
                     )
                     
                     # Add temperature
                     if 'temperature' in ds:
                         temp = float(point['temperature'].values)
-                        text += f"Sea surface temperature: {temp:.2f}°C. "
+                        text += f"Sea surface temperature: {temp:.2f} degrees Celsius. "
                     
                     # Add salinity
                     if 'salinity' in ds:
@@ -162,6 +143,7 @@ if ds is not None:
                     chunk_count += 1
                     
                 except Exception as e:
+                    print(f"Error creating chunk: {e}")
                     continue
     
     print(f"Created {len(texts)} descriptive data chunks")
@@ -173,11 +155,12 @@ if ds is not None:
             try:
                 emb = embed_text(text)
                 store.add(text, emb)
-                if (i + 1) % 100 == 0:
+                if (i + 1) % 50 == 0:
                     print(f"  Indexed {i + 1}/{len(texts)} chunks...")
             except Exception as e:
-                print(f"Error embedding text: {e}")
-                break
+                print(f"Error embedding text chunk {i}: {e}")
+                # Continue with other chunks
+                continue
         print("✓ Vector store ready!")
     else:
         print("✗ No chunks created, vector store remains empty.")
@@ -218,68 +201,38 @@ def extract_query_params(question: str):
     return params
 
 
+def check_coordinates_in_bounds(lat, lon):
+    """Check if coordinates are within dataset bounds."""
+    if DATASET_BOUNDS is None:
+        return True, None
+    
+    in_bounds = (
+        DATASET_BOUNDS['lat_min'] <= lat <= DATASET_BOUNDS['lat_max'] and
+        DATASET_BOUNDS['lon_min'] <= lon <= DATASET_BOUNDS['lon_max']
+    )
+    
+    if not in_bounds:
+        message = (
+            f"Coordinates (lat={lat}, lon={lon}) are outside the dataset coverage area. "
+            f"Dataset covers: Latitude {DATASET_BOUNDS['lat_min']:.1f} to {DATASET_BOUNDS['lat_max']:.1f}°N, "
+            f"Longitude {DATASET_BOUNDS['lon_min']:.1f} to {DATASET_BOUNDS['lon_max']:.1f}°E."
+        )
+        return False, message
+    
+    return True, None
+
+
 def query_dataset_directly(question: str, params: dict):
     """Directly query the xarray dataset for specific point queries."""
     if ds is None:
         return None
     
     try:
-        # If we have lat/lon, try direct query
-        if 'lat' in params and 'lon' in params:
-            lat, lon = params['lat'], params['lon']
-            
-            # Select point
-            point = ds.sel(lat=lat, lon=lon, method='nearest')
-            
-            # Add time if specified
-            if 'time' in params:
-                point = point.sel(time=params['time'], method='nearest')
-            elif 'month' in params:
-                # Convert month name to time
-                month_map = {
-                    'January': '2024-01', 'February': '2024-02', 'March': '2024-03',
-                    'April': '2024-04', 'May': '2024-05', 'June': '2024-06',
-                    'July': '2024-07', 'August': '2024-08', 'September': '2024-09',
-                    'October': '2024-10', 'November': '2024-11', 'December': '2024-12'
-                }
-                month_time = month_map.get(params['month'])
-                if month_time:
-                    point = point.sel(time=month_time, method='nearest')
-            
-            # Build response based on what's being asked
-            response = f"At location (lat={lat}°N, lon={lon}°E"
-            if 'time' in params:
-                response += f", date={params['time']}"
-            elif 'month' in params:
-                response += f", month={params['month']}"
-            response += "):\n"
-            
-            # Check what variable is being asked about
-            if 'temperature' in question.lower() and 'temperature' in point:
-                temp = float(point['temperature'].values)
-                response += f"Temperature: {temp:.2f}°C"
-                return response
-            
-            elif 'salinity' in question.lower() and 'salinity' in point:
-                sal = float(point['salinity'].values)
-                response += f"Salinity: {sal:.2f} PSU"
-                return response
-            
-            # If no specific variable, give overview
-            if 'temperature' in point:
-                temp = float(point['temperature'].values)
-                response += f"- Temperature: {temp:.2f}°C\n"
-            if 'salinity' in point:
-                sal = float(point['salinity'].values)
-                response += f"- Salinity: {sal:.2f} PSU\n"
-            
-            return response.strip()
-        
-        # Handle aggregate queries
+        # Handle aggregate queries FIRST (before coordinate queries)
         if 'average' in question.lower() or 'mean' in question.lower():
             if 'temperature' in question.lower():
                 avg_temp = float(ds['temperature'].mean().values)
-                return f"The average sea surface temperature across all data is {avg_temp:.2f}°C"
+                return f"The average sea surface temperature across all data is {avg_temp:.2f} degrees Celsius"
             elif 'salinity' in question.lower():
                 avg_sal = float(ds['salinity'].mean().values)
                 return f"The average surface salinity across all data is {avg_sal:.2f} PSU"
@@ -291,7 +244,10 @@ def query_dataset_directly(question: str, params: dict):
                     ds['temperature'] == ds['temperature'].max(), drop=True
                 )
                 max_time = pd.Timestamp(max_loc.time.values[0]).strftime('%Y-%m-%d')
-                return f"The maximum sea surface temperature is {max_temp:.2f}°C, occurring on {max_time}"
+                max_lat = float(max_loc.lat.values[0])
+                max_lon = float(max_loc.lon.values[0])
+                return (f"The maximum sea surface temperature is {max_temp:.2f} degrees Celsius, "
+                       f"occurring at lat={max_lat:.2f}°N, lon={max_lon:.2f}°E on {max_time}")
             elif 'salinity' in question.lower():
                 max_sal = float(ds['salinity'].max().values)
                 return f"The maximum surface salinity is {max_sal:.2f} PSU"
@@ -299,13 +255,93 @@ def query_dataset_directly(question: str, params: dict):
         if 'minimum' in question.lower() or 'min' in question.lower() or 'lowest' in question.lower():
             if 'temperature' in question.lower():
                 min_temp = float(ds['temperature'].min().values)
-                return f"The minimum sea surface temperature is {min_temp:.2f}°C"
+                min_loc = ds['temperature'].where(
+                    ds['temperature'] == ds['temperature'].min(), drop=True
+                )
+                min_time = pd.Timestamp(min_loc.time.values[0]).strftime('%Y-%m-%d')
+                min_lat = float(min_loc.lat.values[0])
+                min_lon = float(min_loc.lon.values[0])
+                return (f"The minimum sea surface temperature is {min_temp:.2f} degrees Celsius, "
+                       f"occurring at lat={min_lat:.2f}°N, lon={min_lon:.2f}°E on {min_time}")
             elif 'salinity' in question.lower():
                 min_sal = float(ds['salinity'].min().values)
                 return f"The minimum surface salinity is {min_sal:.2f} PSU"
         
+        # If we have lat/lon, try direct query
+        if 'lat' in params and 'lon' in params:
+            lat, lon = params['lat'], params['lon']
+            
+            # Check if coordinates are in bounds
+            in_bounds, message = check_coordinates_in_bounds(lat, lon)
+            if not in_bounds:
+                return message
+            
+            # Select point using nearest neighbor (this ALWAYS works for in-bounds coords)
+            point = ds.sel(lat=lat, lon=lon, method='nearest')
+            
+            # Get the actual coordinates that were selected
+            actual_lat = float(point.lat.values)
+            actual_lon = float(point.lon.values)
+            
+            # Add time if specified
+            if 'time' in params:
+                point = point.sel(time=params['time'], method='nearest')
+                time_str = params['time']
+            elif 'month' in params:
+                # Convert month name to time
+                month_map = {
+                    'January': '2024-01', 'February': '2024-02', 'March': '2024-03',
+                    'April': '2024-04', 'May': '2024-05', 'June': '2024-06',
+                    'July': '2024-07', 'August': '2024-08', 'September': '2024-09',
+                    'October': '2024-10', 'November': '2024-11', 'December': '2024-12'
+                }
+                month_time = month_map.get(params['month'])
+                if month_time:
+                    point = point.sel(time=month_time, method='nearest')
+                    time_str = params['month']
+                else:
+                    time_str = "all available times"
+            else:
+                # Use the first time point if no time specified
+                point = point.isel(time=0)
+                time_str = pd.Timestamp(point.time.values).strftime('%Y-%m')
+            
+            # Build response
+            response = f"At location lat={actual_lat:.2f}°N, lon={actual_lon:.2f}°E"
+            if actual_lat != lat or actual_lon != lon:
+                response += f" (nearest to requested {lat}°N, {lon}°E)"
+            if time_str != "all available times":
+                response += f" in {time_str}"
+            response += ":\n"
+            
+            # Check what variable is being asked about
+            if 'temperature' in question.lower() and 'temperature' in point:
+                temp = float(point['temperature'].values)
+                response += f"Temperature: {temp:.2f} degrees Celsius"
+                return response
+            
+            elif 'salinity' in question.lower() and 'salinity' in point:
+                sal = float(point['salinity'].values)
+                response += f"Salinity: {sal:.2f} PSU"
+                return response
+            
+            # If no specific variable mentioned, give overview
+            result_parts = []
+            if 'temperature' in point:
+                temp = float(point['temperature'].values)
+                result_parts.append(f"Temperature: {temp:.2f} degrees Celsius")
+            if 'salinity' in point:
+                sal = float(point['salinity'].values)
+                result_parts.append(f"Salinity: {sal:.2f} PSU")
+            
+            if result_parts:
+                response += "\n".join(result_parts)
+                return response.strip()
+        
     except Exception as e:
         print(f"Error in direct query: {e}")
+        import traceback
+        print(traceback.format_exc())
         return None
     
     return None
@@ -318,79 +354,117 @@ class QueryRequest(BaseModel):
 
 def ask_llm(context: str, question: str) -> str:
     """
-    Generate answer using the Flan-T5 model based on retrieved context.
+    Generate answer using the Gemini model based on retrieved context.
     """
-    prompt = (
-f"""Based ONLY on the following ocean data points, answer the user's question concisely and factually. 
-If the information is not present in the data, state that you cannot answer based on the context.
+    if client is None:
+        return "Error: Gemini Client failed to initialize. Cannot generate response."
 
-DATA POINTS:
+    # Add dataset bounds to context if available
+    bounds_info = ""
+    if DATASET_BOUNDS:
+        bounds_info = f"\nDataset Coverage: Latitude {DATASET_BOUNDS['lat_min']:.1f}-{DATASET_BOUNDS['lat_max']:.1f}°N, Longitude {DATASET_BOUNDS['lon_min']:.1f}-{DATASET_BOUNDS['lon_max']:.1f}°E\n"
+
+    prompt = f"""You are an expert Oceanographer AI assistant. Answer the user's question based ONLY on the provided data context below.
+{bounds_info}
+Data Context:
 {context}
 
-QUESTION:
-{question}
+User Question: {question}
 
-ANSWER:"""
-    )
+Instructions:
+- Provide a clear, concise answer based on the data
+- If the data doesn't contain the answer, say so explicitly
+- If coordinates are mentioned that are outside the dataset coverage, state this clearly
+- Use proper units (degrees Celsius for temperature, PSU for salinity)
+- Be specific with numbers when available
+
+Answer:"""
 
     try:
-        # Check if the generator is the fallback function
-        if callable(generator) and not hasattr(generator, "__self__"):
-            return generator(prompt)[0]["generated_text"]
-
-        # Flan-T5 (Seq2Seq) generation parameters
-        result = generator(
-            prompt,
-            max_new_tokens=150,
-            num_return_sequences=1,
-            truncation=True,
+        config = types.GenerateContentConfig(
+            temperature=0.1,
+            max_output_tokens=500,
         )
 
-        if result and len(result) > 0 and "generated_text" in result[0]:
-            answer = result[0]["generated_text"].strip()
-            return answer if answer else "No answer could be generated by the model."
+        response = client.models.generate_content(
+            model=LLM_MODEL_NAME,
+            contents=prompt,
+            config=config,
+        )
+        
+        # Check if response.text is None
+        if response.text is None:
+            # Check for safety blocking
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                if hasattr(response.prompt_feedback, 'block_reason'):
+                    return f"Response blocked by safety filters: {response.prompt_feedback.block_reason}"
+            
+            # Check if candidates were generated
+            if hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'finish_reason'):
+                    return f"Generation stopped: {candidate.finish_reason}"
+            
+            return "No text was generated by the model. Please try rephrasing your question."
 
-        return "Could not generate an answer based on the provided data."
+        answer = response.text.strip()
+        return answer if answer else "No answer could be generated. Please try a different question."
 
     except Exception as e:
         print(f"Error during generation: {e}")
-        return f"Error during LLM generation: {str(e)}"
+        import traceback
+        print(traceback.format_exc())
+        return f"Error generating response: {str(e)}"
 
 
 @app.post("/query")
 def query(request: QueryRequest):
     """Handle query requests with RAG pipeline."""
     try:
+        print(f"\n--- Processing Query: {request.question} ---")
+        
         # Step 1: Try direct dataset query first (for specific point queries)
         params = extract_query_params(request.question)
         direct_answer = query_dataset_directly(request.question, params)
         
         if direct_answer:
+            print("✓ Answered using direct query")
             return {
                 "answer": direct_answer,
                 "method": "direct_query",
-                "context_used": []
+                "context_used": [],
+                "coordinates": params if params else None
             }
         
         # Step 2: Fall back to RAG pipeline
+        print("Using RAG pipeline...")
         query_emb = embed_text(request.question)
         contexts = store.query(query_emb, top_k=5)
-        combined_context = "\n".join(contexts)
+        
+        print(f"Retrieved {len(contexts)} context chunks")
+        
+        combined_context = "\n\n".join(contexts)
 
-        if not combined_context:
-            answer = "No relevant context found in the vector store to answer the question."
+        if not combined_context or len(contexts) == 0:
+            answer = "No relevant data found in the vector store to answer your question. Please try a different query or check if the dataset is properly loaded."
         else:
+            print("Generating answer with LLM...")
             answer = ask_llm(combined_context, request.question)
 
         return {
             "answer": answer,
             "method": "rag_pipeline",
-            "context_used": contexts
+            "context_used": contexts,
+            "num_contexts": len(contexts)
         }
     except Exception as e:
+        import traceback
+        print(f"Error in query endpoint: {e}")
+        print(traceback.format_exc())
         return {
             "answer": f"Error processing query: {str(e)}",
-            "context_used": []
+            "context_used": [],
+            "error": str(e)
         }
 
 
@@ -398,7 +472,8 @@ def query(request: QueryRequest):
 def root():
     return {
         "status": "ok",
-        "message": "Bay of Bengal Ocean RAG API is running",
+        "message": "Bay of Bengal Ocean RAG API is running (powered by Gemini)",
+        "dataset_bounds": DATASET_BOUNDS,
         "endpoints": {
             "POST /query": "Submit a question about ocean data",
             "GET /health": "Check API health",
@@ -409,21 +484,19 @@ def root():
 
 @app.get("/health")
 def health():
-    if generator and hasattr(generator, "__class__"):
-        model_status = (
-            "loaded" if "Pipeline" in generator.__class__.__name__ else "fallback"
-        )
-    else:
-        model_status = "fallback"
-
+    # Model status check
+    model_status = "loaded" if client else "failed to load"
+    
     return {
         "status": "healthy",
         "model_status": model_status,
-        "model_name": LLM_MODEL_NAME if model_status == "loaded" else "none",
+        "model_name": LLM_MODEL_NAME,
         "data_points": len(texts),
+        "vector_store_size": store.index.ntotal if store else 0,
         "dataset_loaded": ds is not None,
         "dataset_variables": list(ds.data_vars) if ds is not None else [],
-        "dataset_path": DATA_PATH if ds is not None else "not found"
+        "dataset_path": DATA_PATH if ds is not None else "not found",
+        "dataset_bounds": DATASET_BOUNDS
     }
 
 
@@ -438,5 +511,6 @@ def dataset_info():
         "dimensions": dict(ds.dims),
         "coords": {k: {"min": float(v.min()), "max": float(v.max())} 
                    for k, v in ds.coords.items()},
-        "attributes": dict(ds.attrs)
+        "attributes": dict(ds.attrs),
+        "bounds": DATASET_BOUNDS
     }
